@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  customer-monthly:
+    build: .
+    image: customer-monthly:latest
+    container_name: customer-monthly
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./secrets/sa.json:/secrets/sa.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python current.py --healthcheck"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
