@@ -177,6 +177,18 @@ def write_to_sheets(spreadsheet_id: str, dfs: Dict[str, pd.DataFrame]):
 
     for name, df in dfs.items():
         try:
+            # Normalize Series -> DataFrame
+            if isinstance(df, pd.Series):
+                df = df.to_frame()
+
+            # If the DataFrame has a meaningful index name or non-default index,
+            # preserve it by resetting the index into a column so the sheet shows row labels.
+            if getattr(df.index, "name", None) is not None and df.index.name != "index":
+                df = df.reset_index()
+
+            # Ensure column names are strings (handles Period objects)
+            df.columns = df.columns.astype(str)
+
             try:
                 ws = sh.worksheet(name)
                 ws.clear()
@@ -272,6 +284,104 @@ def compute_new_old_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return monthly
 
 
+def compute_cohort_metrics(df: pd.DataFrame):
+    """Compute cohort matrices: monthly summary, cohort counts, retention rates, cohort sizes.
+
+    Returns a dict of DataFrames:
+      - Monthly New vs Old (summary)
+      - CohortCounts
+      - RetentionRate
+      - CohortSize
+    """
+    df = df.copy()
+    df["date"] = pd.to_datetime(df.get("date", df.get("Date")), errors="coerce")
+    df = df.dropna(subset=["date", "number"]) if "number" in df.columns else df.dropna(subset=["date"])
+
+    cust_mobile = df.get("customerMobile", pd.Series(dtype=str)).astype(str).fillna("").replace({"nan": "", "NaN": "", "None": ""})
+    cust_name = df.get("customerName", pd.Series(dtype=str)).astype(str).fillna("").replace({"nan": "", "NaN": "", "None": ""})
+    customer_key = cust_mobile.mask(cust_mobile.eq(""), cust_name)
+    df["customer_key"] = customer_key
+    df = df[df["customer_key"].ne("")]
+
+    tx = (
+        df.sort_values("date")
+          .groupby("number", as_index=False)
+          .agg({
+              "customer_key": "first",
+              "date": "first",
+              "orderAmount": "first",
+          })
+    )
+
+    tx["year_month"] = tx["date"].dt.to_period("M")
+
+    # first purchase month per customer (cohort)
+    first_month = tx.groupby("customer_key")["year_month"].min().rename("first_purchase_month")
+    tx = tx.join(first_month, on="customer_key")
+
+    # customer-month level
+    cust_month = (
+        tx.groupby(["customer_key", "year_month"])  # type: ignore
+          .agg(orders=("number", "nunique"), revenue=("orderAmount", "sum"))
+          .reset_index()
+    )
+
+    cust_month = cust_month.join(first_month, on="customer_key")
+    cust_month["is_new"] = cust_month["year_month"] == cust_month["first_purchase_month"]
+
+    # monthly summary
+    monthly_summary = (
+        cust_month.groupby("year_month")
+                  .agg(
+                      total_customers=("customer_key", "nunique"),
+                      new_customers=("is_new", "sum"),
+                      old_customers=("is_new", lambda s: (~s).sum()),
+                      total_orders=("orders", "sum"),
+                      total_revenue=("revenue", "sum"),
+                  )
+                  .reset_index()
+    )
+
+    monthly_summary["year_month"] = monthly_summary["year_month"].astype(str)
+    monthly_summary = monthly_summary.sort_values("year_month")
+
+    # cohort counts matrix
+    cohort_counts = (
+        cust_month.groupby(["first_purchase_month", "year_month"])["customer_key"]
+                  .nunique()
+                  .reset_index()
+                  .pivot(index="first_purchase_month", columns="year_month", values="customer_key")
+    )
+
+    cohort_counts = cohort_counts.fillna(0).astype(int)
+    cohort_counts.index.name = "cohort_month"
+    cohort_counts_display = cohort_counts.copy()
+    cohort_counts_display.columns = cohort_counts_display.columns.astype(str)
+    cohort_counts_display.index = cohort_counts_display.index.astype(str)
+
+    # cohort size and retention
+    cohort_size = (
+        first_month.value_counts().sort_index().rename("cohort_size")
+    )
+    cohort_size.index.name = "cohort_month"
+    cohort_size = cohort_size.reindex(cohort_counts.index, fill_value=0)
+    cohort_size_display = cohort_size.copy().to_frame()
+    cohort_size_display.index = cohort_size_display.index.astype(str)
+
+    cohort_size_nonzero = cohort_size.replace(0, pd.NA)
+    retention_rate = cohort_counts.div(cohort_size_nonzero, axis=0).round(3)
+    retention_display = retention_rate.copy()
+    retention_display.columns = retention_display.columns.astype(str)
+    retention_display.index = retention_display.index.astype(str)
+
+    return {
+        "Monthly New vs Old": monthly_summary,
+        "CohortCounts": cohort_counts_display,
+        "RetentionRate": retention_display,
+        "CohortSize": cohort_size_display,
+    }
+
+
 def run_job():
     input_sheet = os.environ.get("INPUT_SHEET_ID")
     output_sheet = os.environ.get("OUTPUT_SHEET_ID", input_sheet)
@@ -304,6 +414,21 @@ def run_job():
         LOGGER.info("Computed New vs Old Monthly metrics (%s rows)", len(new_old))
     except Exception:
         LOGGER.exception("Failed to compute New vs Old metrics")
+    # compute cohort metrics and add sheets (do not remove existing sheets)
+    try:
+        cohort_results = compute_cohort_metrics(df)
+        for k, v in cohort_results.items():
+            # avoid overwriting existing keys; if conflict, append suffix
+            sheet_name = k
+            if sheet_name in results:
+                i = 1
+                while f"{sheet_name}_{i}" in results:
+                    i += 1
+                sheet_name = f"{sheet_name}_{i}"
+            results[sheet_name] = v
+        LOGGER.info("Computed cohort metrics and added %s sheets", len(cohort_results))
+    except Exception:
+        LOGGER.exception("Failed to compute cohort metrics")
     LOGGER.info("Processing complete, writing %s output sheets", len(results))
     write_to_sheets(output_sheet, results)
     LOGGER.info("Job finished")
