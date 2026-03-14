@@ -10,6 +10,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime
 from dotenv import load_dotenv
 import gspread
+import argparse
+import sys
 import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
@@ -187,6 +189,89 @@ def write_to_sheets(spreadsheet_id: str, dfs: Dict[str, pd.DataFrame]):
             LOGGER.exception("Failed to write sheet %s: %s", name, e)
 
 
+def compute_new_old_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute monthly metrics splitting new vs returning customers.
+
+    Returns a DataFrame with columns:
+    year_month, unique_customers, new_customers, old_customers,
+    total_orders, new_orders, old_orders, total_revenue, new_revenue, old_revenue
+    """
+    df = df.copy()
+    # parse date and require invoice number
+    df["date"] = pd.to_datetime(df.get("date", df.get("Date")), errors="coerce")
+    if "number" in df.columns:
+        df = df.dropna(subset=["date", "number"])  # need date + invoice
+    else:
+        df = df.dropna(subset=["date"])
+
+    # robust customer id
+    cust_mobile = df.get("customerMobile", pd.Series(dtype=str)).astype(str).fillna("").replace({"nan": "", "NaN": ""})
+    cust_name = df.get("customerName", pd.Series(dtype=str)).astype(str).fillna("").replace({"nan": "", "NaN": ""})
+    city = df.get("city", pd.Series(dtype=str)).astype(str).fillna("").replace({"nan": "", "NaN": ""})
+    fallback_id = cust_name + "|" + city
+    customer_id = cust_mobile.mask(cust_mobile.eq(""), fallback_id)
+    df["customer_id"] = customer_id
+    df = df[df["customer_id"].ne("")]
+
+    # collapse to one row per invoice
+    tx = (
+        df.sort_values("date")
+          .groupby("number", as_index=False)
+          .agg({
+              "customer_id": "first",
+              "date": "first",
+              "orderAmount": "first"
+          })
+    )
+
+    tx["year_month"] = tx["date"].dt.to_period("M")
+
+    # first purchase month per customer
+    first_month = tx.groupby("customer_id")["date"].min().dt.to_period("M").rename("first_purchase_month")
+    tx = tx.merge(first_month, on="customer_id", how="left")
+
+    # customer-month level
+    cust_month = (
+        tx.groupby(["customer_id", "year_month"], observed=True)
+          .agg(orders=("number", "nunique"), revenue=("orderAmount", "sum"))
+          .reset_index()
+    )
+
+    cust_month = cust_month.merge(first_month.reset_index(), on="customer_id", how="left")
+    cust_month["is_new"] = cust_month["year_month"] == cust_month["first_purchase_month"]
+
+    # aggregate totals
+    total = cust_month.groupby("year_month").agg(
+        unique_customers=("customer_id", "nunique"),
+        total_orders=("orders", "sum"),
+        total_revenue=("revenue", "sum"),
+    )
+
+    new = cust_month[cust_month["is_new"]].groupby("year_month").agg(
+        new_customers=("customer_id", "nunique"),
+        new_orders=("orders", "sum"),
+        new_revenue=("revenue", "sum"),
+    )
+
+    old = cust_month[~cust_month["is_new"]].groupby("year_month").agg(
+        old_customers=("customer_id", "nunique"),
+        old_orders=("orders", "sum"),
+        old_revenue=("revenue", "sum"),
+    )
+
+    monthly = total.join(new, how="left").join(old, how="left").fillna(0)
+    monthly = monthly.reset_index()
+    monthly["year_month"] = monthly["year_month"].astype(str)
+
+    # ensure integer columns where appropriate
+    for c in ["unique_customers", "new_customers", "old_customers", "total_orders", "new_orders", "old_orders"]:
+        if c in monthly:
+            monthly[c] = monthly[c].astype(int)
+
+    monthly = monthly.sort_values("year_month")
+    return monthly
+
+
 def run_job():
     input_sheet = os.environ.get("INPUT_SHEET_ID")
     output_sheet = os.environ.get("OUTPUT_SHEET_ID", input_sheet)
@@ -212,6 +297,13 @@ def run_job():
         LOGGER.info("Months present in raw data (sample up to 12): %s", list(months_in_raw)[:12])
 
     results = process_dataframe(df)
+    # compute new vs returning customer monthly metrics and add to outputs
+    try:
+        new_old = compute_new_old_metrics(df)
+        results["New vs Old Monthly"] = new_old
+        LOGGER.info("Computed New vs Old Monthly metrics (%s rows)", len(new_old))
+    except Exception:
+        LOGGER.exception("Failed to compute New vs Old metrics")
     LOGGER.info("Processing complete, writing %s output sheets", len(results))
     write_to_sheets(output_sheet, results)
     LOGGER.info("Job finished")
@@ -269,5 +361,32 @@ def main():
         LOGGER.info("Shutting down scheduler")
 
 
+def healthcheck() -> int:
+    """Lightweight healthcheck: verify env and service account file exist.
+
+    Returns 0 if healthy, non-zero otherwise. This should be fast and must NOT start the scheduler.
+    """
+    input_sheet = os.environ.get("INPUT_SHEET_ID")
+    sa_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+
+    if not input_sheet:
+        LOGGER.error("Healthcheck failed: INPUT_SHEET_ID not set")
+        return 1
+
+    if not sa_file or not os.path.exists(sa_file):
+        LOGGER.error("Healthcheck failed: GOOGLE_SERVICE_ACCOUNT_FILE missing or not found (%s)", sa_file)
+        return 2
+
+    LOGGER.info("Healthcheck OK")
+    return 0
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--healthcheck", action="store_true", help="Run a fast healthcheck and exit")
+    args = parser.parse_args()
+
+    if args.healthcheck:
+        sys.exit(healthcheck())
+
     main()
