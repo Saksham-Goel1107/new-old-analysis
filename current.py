@@ -10,6 +10,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime
 from dotenv import load_dotenv
 import gspread
+import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
 LOGGER = logging.getLogger("customer_monthly_job")
@@ -216,16 +217,50 @@ def run_job():
     LOGGER.info("Job finished")
 
 
+def send_heartbeat(success: bool = True, exit_code: int = 0):
+    """Send heartbeat to BetterStack uptime monitor. Uses env var `HEARTBEAT_URL` if set,
+    otherwise uses provided default.
+    On failure, appends `/fail` or `/<exit_code>` to the URL as recommended.
+    """
+    url = os.environ.get("HEARTBEAT_URL", "https://uptime.betterstack.com/api/v1/heartbeat/D73zG99KsRjfUwogYsmoBJtQ")
+    try:
+        if success:
+            # simple GET is accepted as heartbeat
+            requests.get(url, timeout=10)
+            LOGGER.info("Sent success heartbeat to %s", url)
+        else:
+            fail_url = f"{url}/{exit_code if exit_code and exit_code != 0 else 'fail'}"
+            requests.get(fail_url, timeout=10)
+            LOGGER.info("Sent failure heartbeat to %s", fail_url)
+    except Exception:
+        LOGGER.exception("Failed to send heartbeat to %s", url)
+
+
+def execute_and_heartbeat():
+    try:
+        run_job()
+        send_heartbeat(success=True)
+    except SystemExit as e:
+        code = int(getattr(e, "code", 1) or 1)
+        send_heartbeat(success=False, exit_code=code)
+        raise
+    except Exception as e:
+        LOGGER.exception("Job failed: %s", e)
+        # send failure heartbeat with generic non-zero code
+        send_heartbeat(success=False, exit_code=1)
+        raise
+
+
 def main():
     run_once = os.environ.get("RUN_ONCE", "false").lower() in ("1", "true", "yes")
     schedule_days = int(os.environ.get("SCHEDULE_DAYS", "7"))
 
     if run_once:
-        run_job()
+        execute_and_heartbeat()
         return
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(run_job, "interval", days=schedule_days, next_run_time=datetime.now())
+    scheduler.add_job(execute_and_heartbeat, "interval", days=schedule_days, next_run_time=datetime.now())
     LOGGER.info("Scheduled job every %s days. Starting scheduler...", schedule_days)
 
     try:

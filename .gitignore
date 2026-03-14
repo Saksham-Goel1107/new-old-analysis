@@ -1,2 +1,5 @@
-.env
+secrets/
+*.env.bak
+secrets/*.json.env
 service.json
+.env
